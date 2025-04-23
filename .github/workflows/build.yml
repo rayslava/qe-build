@@ -39,10 +39,6 @@ jobs:
         with:
           repository: qemacs/qemacs
           path: qemacs
-      - name: Apply patches
-        run: |
-          ls -lR /home/runner/work/
-          cd musl && patch -p1 < ../patches/musl.patch
       - name: Upload sources
         uses: actions/upload-artifact@v4
         with:
@@ -50,7 +46,6 @@ jobs:
           path: |
             musl/
             qemacs/
-            patches/
 
   build:
     name: Build the QEmacs
