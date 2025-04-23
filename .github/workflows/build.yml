@@ -1,0 +1,228 @@
+---
+name: Build
+on:  # yamllint disable-line rule:truthy
+  push:
+    branches: ["master"]
+    tags:
+      - "v*"
+
+permissions:
+  id-token: write
+  contents: write
+
+env:
+  CFLAGS: >-
+    -static -Oz -flto=full -ffunction-sections -fdata-sections
+    -fvisibility=hidden -fomit-frame-pointer -fno-merge-all-constants
+    -fno-exceptions -fno-unwind-tables -fno-asynchronous-unwind-tables
+  LDFLAGS: >-
+    -static -Oz -flto=full -ffunction-sections -fdata-sections
+    -fvisibility=hidden -fomit-frame-pointer -Wl,--gc-sections -Wl,-O2
+    -Wl,-s -fno-exceptions -fno-unwind-tables -fno-asynchronous-unwind-tables
+  MUSL_PATH: /tmp/musl
+  LLVM_VERSION: 21
+
+jobs:
+  src-checkout:
+    name: Checkout sources
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout this repo
+        uses: actions/checkout@v4
+      - name: Checkout musl
+        uses: actions/checkout@v4
+        with:
+          repository: ifduyue/musl
+          path: musl
+      - name: Checkout QEmacs
+        uses: actions/checkout@v4
+        with:
+          repository: qemacs/qemacs
+          path: qemacs
+      - name: Apply patches
+        run: |
+          ls -lR /home/runner/work/
+          cd musl && patch -p1 < ../patches/musl.patch
+      - name: Upload sources
+        uses: actions/upload-artifact@v4
+        with:
+          name: sources
+          path: |
+            musl/
+            qemacs/
+            patches/
+
+  build:
+    name: Build the QEmacs
+    needs: src-checkout
+    strategy:
+      matrix:
+        arch: [amd64, aarch64]
+        include:
+          - arch: amd64
+            runs-on: ubuntu-latest
+          - arch: aarch64
+            runs-on: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runs-on }}
+    steps:
+      - name: Download sources
+        uses: actions/download-artifact@v4
+        with:
+          name: sources
+          path: .
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential curl \
+          software-properties-common
+
+      - name: Install latest Clang
+        run: |
+          curl -OLv https://apt.llvm.org/llvm.sh
+          chmod 755 llvm.sh
+          sudo ./llvm.sh ${{ env.LLVM_VERSION }} all
+          sudo update-alternatives --install /usr/bin/cc cc \
+          /usr/bin/clang-${{ env.LLVM_VERSION }} 100
+          sudo update-alternatives --install /usr/bin/c++ c++ \
+          /usr/bin/clang++-${{ env.LLVM_VERSION }} 100
+          sudo update-alternatives --install /usr/bin/ld ld \
+          /usr/bin/ld.lld-${{ env.LLVM_VERSION }} 100
+          sudo update-alternatives --install /usr/bin/ar ar \
+          /usr/bin/llvm-ar-${{ env.LLVM_VERSION }} 100
+          sudo update-alternatives --install /usr/bin/nm nm \
+          /usr/bin/llvm-nm-${{ env.LLVM_VERSION }} 100
+          sudo update-alternatives --install /usr/bin/ranlib ranlib \
+          /usr/bin/llvm-ranlib-${{ env.LLVM_VERSION }} 100
+          sudo update-alternatives --install /usr/bin/objcopy objcopy \
+          /usr/bin/llvm-objcopy-${{ env.LLVM_VERSION }} 100
+          sudo update-alternatives --install /usr/bin/objdump objdump \
+          /usr/bin/llvm-objdump-${{ env.LLVM_VERSION }} 100
+          sudo update-alternatives --install /usr/bin/strip strip \
+          /usr/bin/llvm-strip-${{ env.LLVM_VERSION }} 100
+
+      - name: Build and install musl
+        run: |
+          cd musl
+          chmod 755 configure tools/install.sh
+          CLFAGS="${{ env.CFLAGS }}" LDFLAGS="${{ env.LDFLAGS }}" \
+          CC=clang LD=clang \
+          ./configure --prefix="${{ env.MUSL_PATH }}" --disable-shared
+          CLFAGS="${{ env.CFLAGS }}" LDFLAGS="${{ env.LDFLAGS }}" \
+          CC=clang LD=clang \
+          make -j$(nproc)
+          make install
+
+      - name: Build qemacs
+        run: |
+          cd qemacs
+          chmod 755 configure
+          CFLAGS="${{ env.CFLAGS }} -I${{ env.MUSL_PATH }}/include" \
+          LDFLAGS="${{ env.LDFLAGS }} -L${{ env.MUSL_PATH }}/lib" \
+          CC=clang LD=clang \
+          ./configure --prefix=/usr/local --disable-x11 --disable-xv \
+          --disable-xrender --disable-html --disable-png
+          CFLAGS="${{ env.CFLAGS }} -I${{ env.MUSL_PATH }}/include" \
+          LDFLAGS="${{ env.LDFLAGS }} -L${{ env.MUSL_PATH }}/lib" \
+          CC=clang LD=clang \
+          make -j$(nproc) VERBOSE=1
+          cp qe ../qe-${{ matrix.arch }}
+
+      - name: Upload qemacs binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: qe-${{ matrix.arch }}
+          path: qe-${{ matrix.arch }}
+          if-no-files-found: error
+
+  combine-artifacts:
+    name: Combine artifacts
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Create release artifacts directory
+        run: |
+          mkdir -p release-artifacts
+          cp artifacts/qe-amd64/qe-amd64 release-artifacts/
+          cp artifacts/qe-aarch64/qe-aarch64 release-artifacts/
+
+      - name: Upload combined artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: qemacs-binaries
+          path: release-artifacts/*
+
+
+  create-release:
+    name: Create Release
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code for release notes
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Generate Release Notes
+        id: generate_release_notes
+        run: |
+          PREVIOUS_TAG=$(git tag --sort=-creatordate | head -n 2 | tail -n 1)
+          CURRENT_TAG=${GITHUB_REF#refs/tags/}
+          echo "## QEmacs Embeddabe Build: $CURRENT_TAG" > RELEASE_NOTES.md
+          echo "" >> RELEASE_NOTES.md
+          echo "### Changes since $PREVIOUS_TAG" >> RELEASE_NOTES.md
+          echo "" >> RELEASE_NOTES.md
+          git log $PREVIOUS_TAG..$CURRENT_TAG --pretty=format:"* %s (%h)" >> RELEASE_NOTES.md
+          echo "" >> RELEASE_NOTES.md
+          echo "" >> RELEASE_NOTES.md
+          echo "### Binary Downloads" >> RELEASE_NOTES.md
+          echo "* qemacs-amd64: Optimized binary for x86_64 systems" >> RELEASE_NOTES.md
+          echo "* qemacs-aarch64: Optimized binary for AArch64 systems" >> RELEASE_NOTES.md
+          RELEASE_BODY=$(cat RELEASE_NOTES.md)
+          RELEASE_BODY="${RELEASE_BODY//'%'/'%25'}"
+          RELEASE_BODY="${RELEASE_BODY//\n'/'%0A'}"
+          RELEASE_BODY="${RELEASE_BODY//\r'/'%0D'}"
+          echo "::set-output name=release_body::$RELEASE_BODY"
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Create release
+        id: create_release
+        uses: actions/create-release@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tag_name: ${{ github.ref }}
+          release_name: QEmacs Release ${{ github.ref_name }}
+          body: ${{ steps.generate_release_notes.outputs.release_body }}
+          draft: false
+          prerelease: false
+
+      - name: Upload AMD64 binary
+        uses: actions/upload-release-asset@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          upload_url: ${{ steps.create_release.outputs.upload_url }}
+          asset_path: ./artifacts/qe-amd64/qe-amd64
+          asset_name: qemacs-amd64
+          asset_content_type: application/octet-stream
+
+      - name: Upload AArch64 binary
+        uses: actions/upload-release-asset@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          upload_url: ${{ steps.create_release.outputs.upload_url }}
+          asset_path: ./artifacts/qe-aarch64/qe-aarch64
+          asset_name: qemacs-aarch64
+          asset_content_type: application/octet-stream
